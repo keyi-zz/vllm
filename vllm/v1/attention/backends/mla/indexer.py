@@ -122,7 +122,7 @@ class DeepseekV32IndexerBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [1, 64] if current_platform.is_rocm() else [64]
+        return [1, 64] if current_platform.is_rocm() else [64, 128]
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -609,6 +609,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens = seq_lens.unsqueeze(-1)
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
+            # print(f"[DEBUG]============================================================================")
+            # print(f"[DEBUG] Before deep_gemm scheduler_metadata_buffer, value={self.scheduler_metadata_buffer}", flush=True)
             if current_platform.is_cuda() and has_deep_gemm():
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,
@@ -616,6 +618,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     self.num_sms,
                 )
 
+            # traceback.print_stack()
+            # print(f"[DEBUG] scheduler_metadata_buffer, value={self.scheduler_metadata_buffer}", flush=True)
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,
                 seq_lens=seq_lens,
@@ -638,6 +642,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         return attn_metadata
 
+import traceback
 
 def build_prefill_chunk_metadata(
     start_idx: int,

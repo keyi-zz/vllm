@@ -248,6 +248,8 @@ class MomeAttention(AttentionLayerBase, CustomOp):
             hidden_size = self.o_dim
         conv_weight = conv_weight.view(hidden_size, self.kernel_size)
         conv_state = self.kv_cache[state_indice]
+        # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/eager/mome_attention_before_hidden_states.pt")
+        # torch_npu.save_npugraph_tensor(output, save_path = f"/home/q00852295/dump/vllm-ascend/eager/mome_attention_before_output.pt")
         torch.ops.vllm.mome_attention(
             hidden_states,
             conv_state,
@@ -256,6 +258,8 @@ class MomeAttention(AttentionLayerBase, CustomOp):
             self.prefix,
             output,
         )
+        # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/eager/mome_attention_after_hidden_states.pt")
+        # torch_npu.save_npugraph_tensor(output, save_path = f"/home/q00852295/dump/vllm-ascend/eager/mome_attention_after_output.pt")
         return output
 
 
@@ -267,6 +271,7 @@ def mome_attention(
     layer_name: str,
     output: torch.Tensor,
 ) -> None:
+    # print(f"[DEBUG] mome_attention", flush=True)
     forward_context = get_forward_context()
     if forward_context.attn_metadata is None:
         output.fill_(0)
@@ -274,6 +279,10 @@ def mome_attention(
 
     conv_state_ = conv_state.transpose(-1, -2)
     mome_metadata = forward_context.attn_metadata[layer_name]
+    # print(f"=============>{layer_name=}")
+    # if forward_context.draft_attn_metadatas is not None and len(forward_context.draft_attn_metadatas) > 0:
+    #     # print(f"=====================>{layer_name=} {forward_context.draft_attn_metadatas[0].keys()=}")
+    #     mome_metadata = forward_context.draft_attn_metadatas[0][layer_name]
     num_decode_tokens = mome_metadata.num_decode_tokens
     num_prefill_tokens = mome_metadata.num_prefill_tokens
     num_actual_tokens = num_decode_tokens + num_prefill_tokens
@@ -377,6 +386,7 @@ def mome_attention_fake(
     layer_name: str,
     output: torch.Tensor,
 ) -> None:
+    # print(f"[DEBUG] mome_attention_fake", flush=True)
     return
 
 
@@ -388,7 +398,7 @@ direct_register_custom_op(
 )
 
 
-@PluggableLayer.register("static_sink_multi_head_latent_attention")
+@PluggableLayer.register("static_sink_multi_head_latent_attention") # 会被替换
 class StaticSinkMultiHeadLatentAttentionWrapper(PluggableLayer):
     """OpenPangu MLA layer with static sink tokens and optional MoME."""
 
@@ -467,8 +477,11 @@ class StaticSinkMultiHeadLatentAttentionWrapper(PluggableLayer):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # print("[QJJ]StaticSinkMultiHeadLatentAttentionWrapper ")
         q_c = None
         kv_lora = None
+
+        torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/eager/StaticSinkMultiHead_start_hidden_states.pt")
 
         if self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, (
@@ -535,6 +548,8 @@ class StaticSinkMultiHeadLatentAttentionWrapper(PluggableLayer):
         if self.mome_attn is not None:
             attn_out = self.mome_attn(attn_out, state_indice=2) + attn_out
         output = self.o_proj(attn_out)[0]
+        torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/eager/StaticSinkMultiHead_end_hidden_states.pt")
+        torch_npu.save_npugraph_tensor(output, save_path = f"/home/q00852295/dump/vllm-ascend/eager/StaticSinkMultiHead_output.pt")
         return output
 
 
@@ -911,6 +926,7 @@ class OpenPanguMLAAttention(nn.Module):
         self.sliding_window = sliding_window
         # MOME
         if getattr(config, "use_mome", False):
+            # print(f"[QJJ] self.mome_attn = MomeAttention, {prefix=}")
             spec_token_num = 0
             if vllm_config.speculative_config:
                 spec_token_num = vllm_config.speculative_config.num_speculative_tokens
@@ -927,6 +943,7 @@ class OpenPanguMLAAttention(nn.Module):
                 prefix=f"{prefix}.mome_attn",
             )
         else:
+            # print("[QJJ] self.mome_attn = None")
             self.mome_attn = None
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
@@ -948,6 +965,7 @@ class OpenPanguMLAAttention(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
         )
         if self.param_sink_number == 0:
+            # print("[QJJ]MultiHeadLatentAttentionWrapper")
             self.mla_attn = MultiHeadLatentAttentionWrapper(
                 self.hidden_size,
                 self.num_local_heads,
@@ -963,7 +981,8 @@ class OpenPanguMLAAttention(nn.Module):
                 prefix,
             )
         else:
-            self.mla_attn = StaticSinkMultiHeadLatentAttentionWrapper(
+            # print("[QJJ]StaticSinkMultiHeadLatentAttentionWrapper")
+            self.mla_attn = StaticSinkMultiHeadLatentAttentionWrapper( # 走这里
                 self.hidden_size,
                 self.num_local_heads,
                 self.scaling,
@@ -1014,6 +1033,7 @@ class OpenPanguMLAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # print(f"[QJJ] self.mla_attn type: {type(self.mla_attn)}", flush=True)
         return self.mla_attn(positions, hidden_states)
 
     def post_weight_load(self) -> None:
@@ -1484,7 +1504,8 @@ class OpenPanguDecoderLayer(nn.Module):
         )
         self.router_sliding_window = getattr(config, "router_sliding_window", 0)
         if self.use_mla:
-            self.self_attn = OpenPanguMLAAttention(
+            # print("[QJJ]OpenPanguMLAAttention")
+            self.self_attn = OpenPanguMLAAttention( # eager模式走这里
                 config=config,
                 vllm_config=vllm_config,
                 hidden_size=self.hidden_size,
@@ -1522,6 +1543,7 @@ class OpenPanguDecoderLayer(nn.Module):
                     "rope_type": "default",
                     "rope_theta": config.rope_theta,
                 }
+            # print("[QJJ]OpenPanguSinkAttention")
             self.self_attn = OpenPanguSinkAttention(
                 config=config,
                 hidden_size=self.hidden_size,
@@ -1553,6 +1575,7 @@ class OpenPanguDecoderLayer(nn.Module):
                 attn_type = AttentionType.DECODER
             else:
                 attn_type = AttentionType.ENCODER_ONLY
+            # print("[QJJ]OpenPanguEmbeddedAttention")
             self.self_attn = OpenPanguEmbeddedAttention(
                 config=config,
                 hidden_size=self.hidden_size,
@@ -1641,8 +1664,10 @@ class OpenPanguDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.use_mhc and not self.is_mtp_layer:
+            # print("[QJJ]forward_mhc") # 图模式走的这里
             return self.forward_mhc(positions, hidden_states, residual)
         else:
+            # print("[QJJ]forward_normal")
             return self.forward_normal(positions, hidden_states, residual)
 
     def forward_normal(
@@ -1656,11 +1681,15 @@ class OpenPanguDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        
+        # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/graph/OpenPanguDecoderLayer_hidden_states.pt")
 
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+
+        # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/graph/OpenPanguDecoderLayer_self_attn_hidden_states.pt")
 
         if (
             self.routed_scaling_factor is not None
@@ -1699,6 +1728,7 @@ class OpenPanguDecoderLayer(nn.Module):
         if self.has_block_post_layernorm:
             hidden_states, _ = self.block_post_layernorm(hidden_states, residual)
             residual = None
+        # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/graph/OpenPanguDecoderLayer_end_hidden_states.pt")
 
         return hidden_states, residual
 
@@ -1708,14 +1738,22 @@ class OpenPanguDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
+        # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/eager/forward_mhc_hidden_states.pt")
         residual = hidden_states
 
         hidden_states, h_post, h_res = self.attn_mhc_module.hc_pre(hidden_states)
+
+        # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/eager/attn_mhc_module_hidden_states.pt")
         hidden_states = self.input_layernorm(hidden_states)
+
+        # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/eager/input_layernorm_hidden_states.pt")
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+
+
+        # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/eager/self_attn_hidden_states.pt")
 
         if self.sandwich_norm:
             hidden_states = self.post_attention_layernorm(hidden_states)
@@ -1729,6 +1767,8 @@ class OpenPanguDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
 
+        # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/eager/mlp_hidden_states.pt")
+
         if self.sandwich_norm:
             hidden_states = self.post_mlp_layernorm(hidden_states)
         hidden_states = self.mlp_mhc_module.hc_post(
@@ -1737,6 +1777,7 @@ class OpenPanguDecoderLayer(nn.Module):
         if self.has_block_post_layernorm:
             hidden_states = self.block_post_layernorm(hidden_states)
 
+        # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/eager/end_hidden_states.pt")
         return hidden_states, None
 
 
@@ -1836,6 +1877,8 @@ class OpenPanguModel(nn.Module):
                 if self.use_mhc:
                     hidden_states = hidden_states.repeat(1, self.num_stream)
             residual = None
+            if torch.distributed.get_rank() == 0 and hidden_states.shape[0] > 1:
+                torch_npu.save_npugraph_tensor(hidden_states, save_path=f"/home/q00852295/dump/vllm-ascend/graph/hidden_states_input.pt")
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -1843,7 +1886,15 @@ class OpenPanguModel(nn.Module):
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            # if i >= 1:
+            #     break
+            hidden_states, residual = layer(positions, hidden_states, residual) # prefill 阶段hidden_states的shape第0维的大小一定是大于1的，decode一定是等于1的
+            if torch.distributed.get_rank() == 0 and hidden_states.shape[0] > 1 and i <= 1 :
+                # print(f"==tensor name hidden_states_{i}==> f{hidden_states=}")
+                # torch_npu.print_npugraph_tensor(hidden_states, tensor_name="hidden_states_layer")
+                torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/graph/hidden_states_layer_{i}.pt")
+                #  torch.save(hidden_states, f"/home/q00852295/dump/vllm-orig/hidden_states_layer_{i}.pt")
+            #     torch_npu.print_npugraph_tensor(hidden_states, tensor_name = f"hidden_states_layer_{i}.pt")
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

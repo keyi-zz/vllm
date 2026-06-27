@@ -1147,6 +1147,7 @@ class SpecDecodeBaseProposer:
             per_group_attn_metadata.append(attn_metadata)
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
+                
         return per_group_attn_metadata, per_layer_attn_metadata
 
     def model_returns_tuple(self) -> bool:
@@ -1875,6 +1876,7 @@ class SpecDecodeBaseProposer:
             # Layers with the same backend/spec may still live in different
             # KV cache groups and therefore need different block tables.
             group_key = (gid, attn_backend.full_cls_name(), spec)
+            print(f"=======_draft_attn_layer_names======> {layer_name=} {group_key=}")
 
             if group_key not in attention_groups:
                 kernel_block_size = (
@@ -1897,6 +1899,7 @@ class SpecDecodeBaseProposer:
             else:
                 attention_groups[group_key].layer_names.append(layer_name)
 
+        print(f"=======draft_attn_groups key========> {attention_groups.keys()}")
         self.draft_attn_groups = list(attention_groups.values())
         self._block_size_by_gid = {}
         self._slot_mapping_buffers_by_gid = {}

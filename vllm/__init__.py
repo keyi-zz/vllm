@@ -99,3 +99,4 @@ __all__ = [
     "initialize_ray_cluster",
     "PoolingParams",
 ]
+from vllm.sampling_params import SamplingParams

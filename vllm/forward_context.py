@@ -194,6 +194,11 @@ def get_forward_context() -> ForwardContext:
         "Forward context is not set. "
         "Please use `set_forward_context` to set the forward context."
     )
+    # print(f"[DEBUG] forward_context: {_forward_context}", flush=True)
+    # print(f"[DEBUG] forward_context type: {type(_forward_context)}", flush=True)
+    # print(f"[DEBUG] forward_context.attn_metadata: {_forward_context.attn_metadata}", flush=True)
+    # print(f"[DEBUG] forward_context.no_compile_layers: {_forward_context.no_compile_layers}", flush=True)
+    # print(f"[DEBUG] forward_context.cudagraph_runtime_mode: {_forward_context.cudagraph_runtime_mode}", flush=True)
     return _forward_context
 
 
