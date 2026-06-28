@@ -20,6 +20,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import typing
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -39,6 +40,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import (
@@ -116,6 +118,43 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_attn_diffkv import FlashAttentionDiffKVBackend
 from vllm.v1.kv_cache_interface import SlidingWindowMomeSpec
+
+logger = init_logger(__name__)
+
+
+def _bypass_enabled(module: str) -> bool:
+    """Whether module is listed in VLLM_BYPASS_MODULES."""
+    raw = os.environ.get("VLLM_BYPASS_MODULES", "")
+    return module in {x.strip() for x in raw.split(",") if x.strip()}
+
+
+def _bypass_layer_enabled(layer_idx: int) -> bool:
+    """Whether layer_idx is in VLLM_BYPASS_LAYERS (unset means all layers)."""
+    raw = os.environ.get("VLLM_BYPASS_LAYERS", "")
+    if not raw:
+        return True
+    if raw.strip() == "all":
+        return True
+    return layer_idx in {int(x) for x in raw.split(",") if x.strip()}
+
+
+def _should_bypass(module: str, layer_idx: int) -> bool:
+    """Graph-debug bypass gate: module name and layer index must both match."""
+    return _bypass_enabled(module) and _bypass_layer_enabled(layer_idx)
+
+
+def _should_skip_layer(layer_idx: int) -> bool:
+    """Skip layers in [VLLM_SKIP_LAYERS_FROM, VLLM_SKIP_LAYERS_TO] inclusive."""
+    skip_from = os.environ.get("VLLM_SKIP_LAYERS_FROM")
+    skip_to = os.environ.get("VLLM_SKIP_LAYERS_TO")
+    if skip_from is None or skip_to is None:
+        return False
+    return int(skip_from) <= layer_idx <= int(skip_to)
+
+
+def _log_bypass(module: str, layer_idx: int) -> None:
+    if os.environ.get("VLLM_BYPASS_LOG") == "1":
+        logger.warning("BYPASS %s layer=%s", module, layer_idx)
 
 
 def check_ffn_act_fn(act_fn: str):
@@ -814,6 +853,7 @@ class OpenPanguMLAAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
 
         self.prefix = prefix
+        self.layer_idx = extract_layer_index(prefix)
 
         if self.q_lora_rank is not None:
             self.fused_qkv_a_proj = MergedColumnParallelLinear(
@@ -1034,6 +1074,9 @@ class OpenPanguMLAAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         # print(f"[QJJ] self.mla_attn type: {type(self.mla_attn)}", flush=True)
+        if _should_bypass("mla", self.layer_idx):
+            _log_bypass("mla", self.layer_idx)
+            return hidden_states
         return self.mla_attn(positions, hidden_states)
 
     def post_weight_load(self) -> None:
@@ -1663,12 +1706,14 @@ class OpenPanguDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self.use_mhc and not self.is_mtp_layer:
+        use_mhc_path = self.use_mhc and not self.is_mtp_layer
+        if use_mhc_path and not _should_bypass("mhc", self.layer_idx):
             # print("[QJJ]forward_mhc") # 图模式走的这里
             return self.forward_mhc(positions, hidden_states, residual)
-        else:
-            # print("[QJJ]forward_normal")
-            return self.forward_normal(positions, hidden_states, residual)
+        if use_mhc_path and _should_bypass("mhc", self.layer_idx):
+            _log_bypass("mhc", self.layer_idx)
+        # print("[QJJ]forward_normal")
+        return self.forward_normal(positions, hidden_states, residual)
 
     def forward_normal(
         self,
@@ -1684,10 +1729,13 @@ class OpenPanguDecoderLayer(nn.Module):
         
         # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/graph/OpenPanguDecoderLayer_hidden_states.pt")
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
+        if not _should_bypass("attn", self.layer_idx):
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        else:
+            _log_bypass("attn", self.layer_idx)
 
         # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/graph/OpenPanguDecoderLayer_self_attn_hidden_states.pt")
 
@@ -1713,7 +1761,10 @@ class OpenPanguDecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        hidden_states = self.mlp(hidden_states)
+        if not _should_bypass("mlp", self.layer_idx):
+            hidden_states = self.mlp(hidden_states)
+        else:
+            _log_bypass("mlp", self.layer_idx)
 
         if (
             self.routed_scaling_factor is not None
@@ -1747,11 +1798,13 @@ class OpenPanguDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/eager/input_layernorm_hidden_states.pt")
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
-
+        if not _should_bypass("attn", self.layer_idx):
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        else:
+            _log_bypass("attn", self.layer_idx)
 
         # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/eager/self_attn_hidden_states.pt")
 
@@ -1765,7 +1818,10 @@ class OpenPanguDecoderLayer(nn.Module):
         hidden_states = self.pre_mlp_layernorm(hidden_states)
 
         # Fully Connected
-        hidden_states = self.mlp(hidden_states)
+        if not _should_bypass("mlp", self.layer_idx):
+            hidden_states = self.mlp(hidden_states)
+        else:
+            _log_bypass("mlp", self.layer_idx)
 
         # torch_npu.save_npugraph_tensor(hidden_states, save_path = f"/home/q00852295/dump/vllm-ascend/eager/mlp_hidden_states.pt")
 
@@ -1884,7 +1940,13 @@ class OpenPanguModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        max_layer = int(os.environ.get("VLLM_MAX_LAYER", "-1"))
         for i in range(self.start_layer, self.end_layer):
+            if max_layer >= 0 and i > max_layer:
+                break
+            if _should_bypass("layer", i) or _should_skip_layer(i):
+                _log_bypass("layer", i)
+                continue
             layer = self.layers[i]
             # if i >= 1:
             #     break
